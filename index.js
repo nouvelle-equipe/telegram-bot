@@ -3,26 +3,31 @@ import TelegramBot from "node-telegram-bot-api";
 import OpenAI from "openai";
 
 /**
- * ENV VARS (Render)
+ * Render ENV VARS:
  * - TELEGRAM_BOT_TOKEN
  * - OPENAI_API_KEY
- * - OPENAI_ASSISTANT_ID   (asst_...)
- * - PORT                  (Render zet dit automatisch)
+ * - OPENAI_PROMPT_ID        (pmpt_...)
+ * - OPENAI_MODEL            (optioneel; bv gpt-4o-mini)
+ * - PORT                    (Render zet dit automatisch)
  */
 
 const {
   TELEGRAM_BOT_TOKEN,
   OPENAI_API_KEY,
-  OPENAI_ASSISTANT_ID,
+  OPENAI_PROMPT_ID,
+  OPENAI_MODEL,
   PORT,
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-if (!OPENAI_ASSISTANT_ID) throw new Error("Missing OPENAI_ASSISTANT_ID");
+if (!OPENAI_PROMPT_ID) throw new Error("Missing OPENAI_PROMPT_ID (pmpt_...)");
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
 /* -------------------------
-   1) MINI HEALTH SERVER (voor Render Web Service)
+   1) MINI HEALTH SERVER (Render Web Service needs a port)
 -------------------------- */
 const port = PORT || 3000;
 http
@@ -30,36 +35,27 @@ http
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("OK");
   })
-  .listen(port, () => {
-    console.log(`Health server listening on ${port}`);
-  });
+  .listen(port, () => console.log(`Health server listening on ${port}`));
 
 /* -------------------------
-   2) TELEGRAM + OPENAI
+   2) SESSIONS: 1 flow + 1 conversation state per user
 -------------------------- */
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// In-memory sessions (reset bij redeploy)
 const sessions = new Map();
 /**
  * sessions.get(userId) => {
- *   threadId: string,
- *   mode: "WORK" | "HIRING" | "GENERAL"
+ *   mode: "WORK"|"HIRING"|"GENERAL"|null,
+ *   previousResponseId: string|null
  * }
  */
-
 function getSession(userId) {
-  if (!sessions.has(userId)) sessions.set(userId, { threadId: null, mode: null });
+  if (!sessions.has(userId)) sessions.set(userId, { mode: null, previousResponseId: null });
   return sessions.get(userId);
 }
 
-async function getOrCreateThread(userId) {
-  const s = getSession(userId);
-  if (s.threadId) return s.threadId;
-  const thread = await openai.beta.threads.create();
-  s.threadId = thread.id;
-  return thread.id;
+function modeToLabel(mode) {
+  if (mode === "WORK") return "Werkzoekend";
+  if (mode === "HIRING") return "Personeel inhuren";
+  return "Algemeen";
 }
 
 function mainMenuKeyboard() {
@@ -75,79 +71,28 @@ function mainMenuKeyboard() {
   };
 }
 
-function modeToLabel(mode) {
-  if (mode === "WORK") return "Werkzoekend";
-  if (mode === "HIRING") return "Personeel inhuren";
-  return "Algemeen";
-}
-
 function modeHint(mode) {
   if (mode === "WORK") {
     return (
-      "Top! 👤\nStuur:\n" +
-      "1) Welke functie?\n2) Welke stad/regio?\n3) Wanneer beschikbaar?\n\n" +
-      "Je mag ook gewoon je vraag typen."
+      "Top! 👤\nStuur (als je wil):\n" +
+      "1) Functie\n2) Stad/regio\n3) Beschikbaarheid\n\n" +
+      "Of typ gewoon je vraag."
     );
   }
   if (mode === "HIRING") {
     return (
-      "Helemaal goed! 🏢\nStuur:\n" +
-      "1) Datum/tijd\n2) Locatie\n3) Aantal mensen + functies\n\n" +
-      "Je mag ook gewoon je vraag typen."
+      "Helemaal goed! 🏢\nStuur (als je wil):\n" +
+      "1) Datum/tijd\n2) Locatie\n3) Aantal + functies\n\n" +
+      "Of typ gewoon je vraag."
     );
   }
   return "Oké 💬 Typ je vraag maar, ik help je meteen.";
 }
 
-async function runAssistant({ userId, userText }) {
-  const s = getSession(userId);
-  const threadId = await getOrCreateThread(userId);
-
-  // We sturen de gekozen “flow” mee als context voor jullie prompt
-  const contextPrefix =
-    s.mode ? `[CONTEXT: ${modeToLabel(s.mode)}]\n` : "[CONTEXT: Onbekend]\n";
-
-  await openai.beta.threads.messages.create(threadId, {
-    role: "user",
-    content: contextPrefix + userText,
-  });
-
-  const run = await openai.beta.threads.runs.create(threadId, {
-    assistant_id: OPENAI_ASSISTANT_ID,
-    metadata: { telegram_user_id: String(userId) },
-  });
-
-  // Wachten tot klaar (simpel)
-  while (true) {
-    await new Promise((r) => setTimeout(r, 800));
-    const status = await openai.beta.threads.runs.retrieve(threadId, run.id);
-
-    if (status.status === "completed") break;
-
-    // Als jullie later tools/function calling doen, moet je dit uitbreiden:
-    if (status.status === "requires_action") {
-      throw new Error("Run requires_action (tools) — tool handling not implemented.");
-    }
-
-    if (["failed", "cancelled", "expired"].includes(status.status)) {
-      throw new Error(`Run ended with status: ${status.status}`);
-    }
-  }
-
-  const messages = await openai.beta.threads.messages.list(threadId, { limit: 10 });
-  const latest = messages.data.find((m) => m.role === "assistant");
-  const textPart = latest?.content?.find((c) => c.type === "text");
-
-  return textPart?.text?.value?.trim() || "Ik kon even geen antwoord maken. Probeer het opnieuw 🙏";
-}
-
-/* -------------------------
-   3) START + FLOW
--------------------------- */
 async function sendWelcome(chatId, userId) {
   const s = getSession(userId);
   const modeLine = s.mode ? `Huidige flow: ${modeToLabel(s.mode)}\n\n` : "";
-  await bot.sendMessage(
+  return bot.sendMessage(
     chatId,
     "Welkom bij Nouvelle Équipe 👋\n\n" +
       modeLine +
@@ -156,7 +101,41 @@ async function sendWelcome(chatId, userId) {
   );
 }
 
-// /start en tekstberichten
+/* -------------------------
+   3) OPENAI CALL (Prompt ID + variables + conversation via previous_response_id)
+   Zorg dat je Prompt Template variabelen heeft zoals:
+   - {{user_text}}
+   - {{context}}
+-------------------------- */
+async function askWithPrompt({ userId, userText, context }) {
+  const s = getSession(userId);
+
+  const resp = await openai.responses.create({
+    // model is meestal required; als je prompt template al een model afdwingt,
+    // kun je OPENAI_MODEL alsnog gewoon zetten om zeker te zijn.
+    model: OPENAI_MODEL || "gpt-4o-mini",
+    prompt: {
+      id: OPENAI_PROMPT_ID,
+      variables: {
+        user_text: userText,
+        context: context || "Algemeen",
+      },
+    },
+    // dit houdt de conversatie “aan elkaar” per Telegram user
+    previous_response_id: s.previousResponseId || undefined,
+
+    metadata: { telegram_user_id: String(userId) },
+  });
+
+  // bewaar state voor volgende beurt
+  s.previousResponseId = resp.id;
+
+  return (resp.output_text || "").trim() || "Ik kon even geen antwoord maken. Probeer het opnieuw 🙏";
+}
+
+/* -------------------------
+   4) TELEGRAM HANDLERS
+-------------------------- */
 bot.on("message", async (msg) => {
   const chatId = msg.chat?.id;
   const userId = msg.from?.id;
@@ -164,9 +143,7 @@ bot.on("message", async (msg) => {
 
   if (!chatId || !userId || !text) return;
 
-  if (text.startsWith("/start")) {
-    return sendWelcome(chatId, userId);
-  }
+  if (text.startsWith("/start")) return sendWelcome(chatId, userId);
 
   if (text.startsWith("/reset")) {
     sessions.delete(userId);
@@ -174,20 +151,19 @@ bot.on("message", async (msg) => {
     return sendWelcome(chatId, userId);
   }
 
-  // Als iemand nog geen flow koos, stuur menu
   const s = getSession(userId);
   if (!s.mode) {
-    await bot.sendMessage(
-      chatId,
-      "Eerst even kiezen wat je wilt doen 🙂",
-      { reply_markup: mainMenuKeyboard() }
-    );
+    await bot.sendMessage(chatId, "Eerst even kiezen 🙂", { reply_markup: mainMenuKeyboard() });
     return;
   }
 
   try {
     await bot.sendChatAction(chatId, "typing");
-    const answer = await runAssistant({ userId, userText: text });
+    const answer = await askWithPrompt({
+      userId,
+      userText: text,
+      context: modeToLabel(s.mode),
+    });
     await bot.sendMessage(chatId, answer, { disable_web_page_preview: true });
   } catch (e) {
     console.error(e);
@@ -195,7 +171,6 @@ bot.on("message", async (msg) => {
   }
 });
 
-// Knoppen (inline keyboard)
 bot.on("callback_query", async (q) => {
   const chatId = q.message?.chat?.id;
   const userId = q.from?.id;
@@ -204,6 +179,8 @@ bot.on("callback_query", async (q) => {
   if (!chatId || !userId || !data) return;
 
   try {
+    const s = getSession(userId);
+
     if (data === "RESET") {
       sessions.delete(userId);
       await bot.answerCallbackQuery(q.id, { text: "Gerest ✅" });
@@ -211,14 +188,12 @@ bot.on("callback_query", async (q) => {
       return sendWelcome(chatId, userId);
     }
 
-    const s = getSession(userId);
-
     if (data === "MODE_WORK") s.mode = "WORK";
     if (data === "MODE_HIRING") s.mode = "HIRING";
     if (data === "MODE_GENERAL") s.mode = "GENERAL";
 
-    // (optioneel) thread resetten bij mode switch:
-    // s.threadId = null;
+    // optioneel: conversation state reset bij mode switch
+    // s.previousResponseId = null;
 
     await bot.answerCallbackQuery(q.id, { text: `Flow: ${modeToLabel(s.mode)}` });
     await bot.sendMessage(chatId, modeHint(s.mode));
@@ -228,4 +203,4 @@ bot.on("callback_query", async (q) => {
   }
 });
 
-console.log("✅ Telegram bot draait (polling) + Render port binding + flow menu");
+console.log("✅ Telegram bot draait (polling) + Render port binding + Prompt ID flow menu");
