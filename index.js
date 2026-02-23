@@ -1,58 +1,104 @@
 import TelegramBot from "node-telegram-bot-api";
 import OpenAI from "openai";
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const {
+  TELEGRAM_BOT_TOKEN,
+  OPENAI_API_KEY,
+  OPENAI_ASSISTANT_ID, // jullie prompt/assistant id
+} = process.env;
 
-const ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
+if (!TELEGRAM_BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+if (!OPENAI_ASSISTANT_ID) throw new Error("Missing OPENAI_ASSISTANT_ID");
 
-async function askOpenAI(userText, userId) {
-  // 1. Thread aanmaken
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// 1 thread per telegram user (simpel; reset bij redeploy)
+const userThreads = new Map();
+
+async function getOrCreateThread(userId) {
+  if (userThreads.has(userId)) return userThreads.get(userId);
   const thread = await openai.beta.threads.create();
+  userThreads.set(userId, thread.id);
+  return thread.id;
+}
 
-  // 2. User message toevoegen
-  await openai.beta.threads.messages.create(thread.id, {
+async function runAssistant({ userText, userId }) {
+  const threadId = await getOrCreateThread(userId);
+
+  // user message
+  await openai.beta.threads.messages.create(threadId, {
     role: "user",
     content: userText,
   });
 
-  // 3. Run starten met jullie Assistant / Prompt
-  const run = await openai.beta.threads.runs.create(thread.id, {
-    assistant_id: ASSISTANT_ID,
+  // run assistant/prompt
+  const run = await openai.beta.threads.runs.create(threadId, {
+    assistant_id: OPENAI_ASSISTANT_ID,
     metadata: { telegram_user_id: String(userId) },
   });
 
-  // 4. Wachten tot klaar
-  let status;
-  do {
-    await new Promise(r => setTimeout(r, 800));
-    status = await openai.beta.threads.runs.retrieve(thread.id, run.id);
-  } while (status.status !== "completed");
+  // wait until finished
+  while (true) {
+    await new Promise((r) => setTimeout(r, 800));
+    const status = await openai.beta.threads.runs.retrieve(threadId, run.id);
 
-  // 5. Antwoord ophalen
-  const messages = await openai.beta.threads.messages.list(thread.id);
-  return messages.data[0].content[0].text.value;
+    if (status.status === "completed") break;
+
+    // als je later tools gebruikt (function calling), dan kun je dit uitbreiden
+    if (status.status === "requires_action") {
+      throw new Error("Run requires_action (tools). Implement tool handling if needed.");
+    }
+
+    if (["failed", "cancelled", "expired"].includes(status.status)) {
+      throw new Error(`Run ended with status: ${status.status}`);
+    }
+  }
+
+  // latest assistant message ophalen
+  const messages = await openai.beta.threads.messages.list(threadId, { limit: 10 });
+
+  const latest = messages.data.find((m) => m.role === "assistant");
+  const textPart = latest?.content?.find((c) => c.type === "text");
+
+  return textPart?.text?.value?.trim() || "Ik kon even geen antwoord maken. Probeer het opnieuw 🙏";
 }
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat?.id;
-  const text = msg.text?.trim();
   const userId = msg.from?.id;
+  const text = msg.text?.trim();
 
-  if (!chatId || !text) return;
+  if (!chatId || !userId || !text) return;
 
-  if (text === "/start") {
-    return bot.sendMessage(chatId, "Hi! Stuur je vraag 🙌");
+  // /start
+  if (text.startsWith("/start")) {
+    return bot.sendMessage(
+      chatId,
+      "Welkom bij Nouvelle Équipe 👋\n\n" +
+        "Ik help je met:\n" +
+        "• Vacatures & werk\n" +
+        "• Personeel inhuren\n" +
+        "• Algemene vragen\n\n" +
+        "Stel je vraag en ik help je verder."
+    );
+  }
+
+  // optioneel: /reset om conversation te resetten
+  if (text.startsWith("/reset")) {
+    userThreads.delete(userId);
+    return bot.sendMessage(chatId, "Helemaal goed — je gesprek is gereset. Stel je vraag opnieuw 🙌");
   }
 
   try {
     await bot.sendChatAction(chatId, "typing");
-    const answer = await askOpenAI(text, userId);
-    await bot.sendMessage(chatId, answer);
+    const answer = await runAssistant({ userText: text, userId });
+    await bot.sendMessage(chatId, answer, { disable_web_page_preview: true });
   } catch (e) {
     console.error(e);
-    await bot.sendMessage(chatId, "Er ging iets mis, probeer het nog eens.");
+    await bot.sendMessage(chatId, "Oeps — er ging iets mis. Probeer het nog eens.");
   }
 });
 
-console.log("Telegram bot draait met OpenAI Prompt ID 🚀");
+console.log("✅ Telegram bot draait (polling) met OpenAI Prompt/Assistant ID");
